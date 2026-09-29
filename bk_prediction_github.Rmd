@@ -1,0 +1,363 @@
+---
+title: "Analysis code for prediction of BK polyomavirus-associated nephropathy"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+This code reproduces the model development, internal validation, external validation, performance measures, and figures reported in the manuscript.
+
+Analyses begin from two analysis-ready datasets:
+
+- `df_au`: Australian derivation cohort
+- `df_nz`: New Zealand external validation cohort
+
+Individual-level ANZDATA Registry data cannot be distributed publicly because access is subject to Registry governance and ethics requirements. Consequently, source-data extraction and dataset-construction code are not included in this repository.
+
+
+# Load packages
+```{r}
+library(tidyverse)
+library(pROC)
+library(patchwork)
+library(jtools)
+```
+
+
+# Performance derivation
+## Apparent AUC
+```{r}
+
+
+
+model_au <- glm(formula = event ~ ageattransplant + BMI + CNI + dgf + donorsourcecode + egfr + era + ethnicity + gendercode + induction_tcelldep + antimetabolite + prednisolone + rejection + tercile + time_period, family = binomial(link = "cloglog"),
+    data = df_au)
+
+predictions_au <- predict(model_au, type = "link")
+
+# Area under the curve
+auc_apparent <- roc(df_au$event, predictions_au)$auc
+auc_apparent
+
+ci.auc(auc_apparent)
+
+```
+
+## Apparent Brier
+```{r}
+
+p <- 1 - exp(-exp(predictions_au))
+brier <- mean((df_au$event - p)^2)
+brier
+```
+
+
+## ROC curve
+```{r}
+roc_au <- roc(
+  response = df_au$event,
+  predictor = predictions_au
+)
+
+roc_df_au <- data.frame(
+  specificity = roc_au$specificities,
+  sensitivity = roc_au$sensitivities
+)
+
+ci_vals <- ci.auc(roc_au)
+
+ci_text <- paste0(
+  round(ci_vals[1], 2),
+  "–",
+  round(ci_vals[3], 2)
+)
+
+p_deriv <- ggplot(roc_df_au, aes(x = 1 - specificity, y = sensitivity)) +
+  geom_line(size = 1, colour = "#BC3C29FF") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", colour = "#34495e"
+  ) +
+  coord_equal() +
+  labs(
+    title = "Derivation cohort (Australia)",
+    x = "1 - Specificity",
+    y = "Sensitivity"
+  ) +
+  annotate(
+     "label",
+    x = 0.65,
+    y = 0.20,
+    label = paste0(
+      "AUC = ", round(auc(roc_au), 2), " (95% CI: ", ci_text, ")"
+    ),
+    size = 5,
+    fill = "white",
+    colour = "#34495e",
+    linewidth = 0.5
+  ) +
+  theme_nice()
+
+p_deriv
+
+```
+
+
+## Optimism adjusted AUC
+```{r}
+
+set.seed(2026)
+
+B <- 500
+n <- nrow(df_au)
+
+bootstrap_results <-
+  tibble(
+    b = 1:B,
+    idx = map(b, ~ sample(seq_len(n), replace = TRUE))
+  ) %>%
+  mutate(
+
+    # Bootstrap dataset
+    data_boot = map(idx, ~ df_au[.x, ]),
+
+    # Fit model in bootstrap sample
+    fit_boot = map(data_boot, ~ glm(
+      model_au,
+      family = binomial(link = "cloglog"),
+      data = .x
+    )),
+
+    # Apparent AUC in bootstrap sample
+    auc_boot_app = map2_dbl(
+      fit_boot, data_boot,
+      ~ roc(.y$event, predict(.x, type = "link"))$auc
+    ),
+
+    # Test AUC in original AU data
+    auc_boot_test = map_dbl(
+      fit_boot,
+      ~ roc(df_au$event, predict(.x, newdata = df_au, type = "link"))$auc
+    ),
+
+    optimism_auc = auc_boot_app - auc_boot_test,
+
+
+    # ----- Calibration slope -----
+
+    # Apparent slope in bootstrap sample
+    slope_boot_app = map2_dbl(
+      fit_boot, data_boot,
+      ~ {
+        lp_boot <- predict(.x, type = "link")
+        cal_boot <- glm(
+          event ~ lp_boot,
+          family = binomial(link = "cloglog"),
+          data = .y
+        )
+        coef(cal_boot)[2]
+      }
+    ),
+
+    # Test slope in original AU data
+    slope_boot_test = map_dbl(
+      fit_boot,
+      ~ {
+        lp_test <- predict(.x, newdata = df_au, type = "link")
+        cal_test <- glm(
+          event ~ lp_test,
+          family = binomial(link = "cloglog"),
+          data = df_au
+        )
+        coef(cal_test)[2]
+      }
+    ),
+
+    optimism_slope = slope_boot_app - slope_boot_test
+  )
+
+bootstrap_results <- bootstrap_results %>%
+  select(b, auc_boot_app, auc_boot_test, optimism_auc, slope_boot_app, slope_boot_test, optimism_slope)
+
+
+mean_optimism_auc <- mean(bootstrap_results$optimism_auc)
+auc_corrected <- auc_apparent - mean_optimism_auc
+
+auc_corrected
+```
+
+## Optimism adjusted calibration 
+```{r}
+cal_app_au <- glm(
+  event ~ predictions_au,
+  family = binomial(link = "cloglog"),
+  data = df_au
+)
+
+intercept_app <- coef(cal_app_au)[1]
+slope_app <- coef(cal_app_au)[2]
+
+mean_optimism_slope <- mean(bootstrap_results$optimism_slope)
+
+slope_corrected <- slope_app - mean_optimism_slope
+
+slope_app
+slope_corrected
+
+```
+
+## Apparent calibration curve
+```{r}
+
+p_deriv_calib <- df_au %>%
+  mutate(pred_prob = 1 - exp(-exp(predictions_au))) %>% 
+    mutate(decile = ntile(pred_prob, 10)) %>%
+  group_by(decile) %>%
+  summarise(
+       predicted = mean(pred_prob),
+    observed = mean(event),
+    events = sum(event),
+    n = n(),
+    .groups = "drop") %>%  
+  ggplot(aes(x = predicted, y = observed)) +
+  geom_point(size = 3, col = "#34495e") +
+  geom_smooth(se = F, span = 1, col = "#BC3C29FF", linewidth = 0.75) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", col = "#34495e") +
+  labs(
+    x = "Mean Predicted Risk",
+    y = "Observed Event Rate",
+    title = "Derivation cohort (Australia)"
+  ) +
+  coord_equal() +
+  theme_nice() +
+  coord_equal(
+    xlim = c(0, 0.03),
+    ylim = c(0, 0.03)
+  )
+
+p_deriv_calib
+```
+
+
+# Performance validation
+## AUC
+```{r}
+
+predictions_nz <- predict(model_au, newdata = df_nz, type = "link")
+roc_nz <- roc(df_nz$event, predictions_nz)
+
+auc_nz <- auc(roc_nz)
+
+ci_nz <- ci.auc(roc_nz, method = "delong")
+
+
+auc_nz
+ci_nz
+
+```
+
+
+## Brier 
+```{r}
+p_nz <- predict(model_au, newdata = df_nz, type = "response")
+brier_nz <- mean((df_nz$event - p_nz)^2)
+brier_nz
+
+```
+
+
+
+## ROC curve
+```{r}
+roc_df_nz <- coords(
+  roc_nz,
+  x = "all",
+  ret = c("specificity", "sensitivity"),
+  transpose = FALSE
+) %>% 
+  as.data.frame() %>% 
+  mutate(
+    fpr = 1 - specificity,
+    tpr = sensitivity
+  )
+
+p_valid <- ggplot(roc_df_nz, aes(x = fpr, y = tpr)) +
+  geom_line(size = 1, colour = "#BC3C29FF") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", colour = "#34495e"
+  ) +
+  labs(
+    x = "1 - Specificity",
+    y = "Sensitivity",
+    title = "External validation cohort (New Zealand)"
+  ) +
+  annotate(
+     "label",
+    x = 0.65,
+    y = 0.20,
+    label = paste0(
+      "AUC = ", round(auc_nz, 2),
+      " (95% CI: ", round(ci_nz[1], 2),
+      "–", round(ci_nz[3], 2), ")"
+    ),
+    size = 5,
+    fill = "white",
+    colour = "#34495e",
+    linewidth = 0.5
+  ) +
+  theme_nice()
+
+p_valid
+
+p_deriv + p_valid
+```
+
+
+## Calibration
+```{r}
+cal_model <- glm(
+  event ~ predictions_nz,
+  family = binomial(link = "cloglog"),
+  data = df_nz
+)
+
+summary(cal_model)
+
+df_nz_cal <- df_nz %>%
+  mutate(
+    lp = predictions_nz,
+    pred = 1 - exp(-exp(lp))
+  )
+
+df_cal_plot <- df_nz_cal %>%
+  mutate(
+    decile = ntile(pred, 10)
+  ) %>%
+  group_by(decile) %>%
+  summarise(
+    mean_pred = mean(pred),
+    obs = mean(event),
+    n = n(),
+    .groups = "drop"
+  )
+
+p_valid_calib <- ggplot(df_cal_plot, aes(x = mean_pred, y = obs)) +
+  geom_point(size = 3, col = "#34495e") +
+  geom_smooth(se = F, span = 1, col = "#BC3C29FF", linewidth = 0.75) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", col = "#34495e") +
+  labs(
+    x = "Mean Predicted Risk",
+    y = "Observed Event Rate",
+    title = "Validation cohort (New Zealand)"
+  ) +
+  coord_equal() +
+  theme_nice()  +
+  coord_equal(
+    xlim = c(0, 0.03),
+    ylim = c(0, 0.03)
+  )
+
+
+
+p_valid_calib
+
+p_deriv_calib + p_valid_calib
+
+```
